@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import httpx
@@ -12,11 +13,16 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+MOBILE_REDIRECT_SCHEME = "gastly://auth"
 
 
 @router.get("/google/login")
-async def google_login():
-    """Devuelve la URL de autorización de Google para redirigir al usuario."""
+async def google_login(platform: str = "web"):
+    """
+    Devuelve la URL de autorización de Google.
+    platform=mobile → el callback redirigirá a gastly://auth?token=...
+    platform=web    → el callback devuelve JSON con el token
+    """
     params = {
         "client_id": settings.GOOGLE_CLIENT_ID,
         "redirect_uri": settings.GOOGLE_REDIRECT_URI,
@@ -24,14 +30,19 @@ async def google_login():
         "scope": "openid email profile https://www.googleapis.com/auth/gmail.readonly",
         "access_type": "offline",
         "prompt": "consent",
+        "state": platform,  # "mobile" o "web"
     }
     query = "&".join(f"{k}={v}" for k, v in params.items())
-    return {"url": f"https://accounts.google.com/o/oauth2/v2/auth?{query}"}
+    url = f"https://accounts.google.com/o/oauth2/v2/auth?{query}"
+    return {"url": url}
 
 
-@router.get("/google/callback", response_model=TokenOut)
-async def google_callback(code: str, db: AsyncSession = Depends(get_db)):
-    """Recibe el código de Google, obtiene tokens y crea/actualiza al usuario."""
+@router.get("/google/callback")
+async def google_callback(code: str, state: str = "web", db: AsyncSession = Depends(get_db)):
+    """
+    Recibe el código de Google, obtiene tokens y crea/actualiza al usuario.
+    Si state=mobile redirige a gastly://auth?token=... en lugar de devolver JSON.
+    """
     async with httpx.AsyncClient() as client:
         token_res = await client.post(GOOGLE_TOKEN_URL, data={
             "code": code,
@@ -50,7 +61,6 @@ async def google_callback(code: str, db: AsyncSession = Depends(get_db)):
         user_res = await client.get(GOOGLE_USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"})
         if user_res.status_code != 200:
             raise HTTPException(status_code=400, detail="Error al obtener info del usuario")
-
         info = user_res.json()
 
     result = await db.execute(select(User).where(User.email == info["email"]))
@@ -75,8 +85,13 @@ async def google_callback(code: str, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(user)
 
+    jwt = create_access_token(user.id)
+
+    if state == "mobile":
+        return RedirectResponse(url=f"{MOBILE_REDIRECT_SCHEME}?token={jwt}")
+
     return TokenOut(
-        access_token=create_access_token(user.id),
+        access_token=jwt,
         user=UserOut.model_validate(user),
     )
 
