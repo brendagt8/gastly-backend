@@ -1,19 +1,19 @@
 from datetime import date as DateType, datetime
 from pydantic import BaseModel
-from typing import Literal, Optional
-
-Category = Literal["despensa", "salidas", "gasolina", "salud", "suscripciones", "ropa", "otros"]
+from typing import Optional
 
 
+# La categoría se valida contra la tabla categories en cada ruta,
+# no con un Literal hardcodeado
 class TransactionCreate(BaseModel):
     merchant: str
     amount: float
-    category: Category
+    category: str
     tx_date: Optional[DateType] = None  # defaults to today if not provided
 
 
 class TransactionCategoryUpdate(BaseModel):
-    category: Category
+    category: str
 
 
 class TransactionOut(BaseModel):

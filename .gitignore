@@ -13,10 +13,6 @@ build/
 .env
 *.env.local
 
-# Base de datos local
-*.db
-*.sqlite
-
 # IDE
 .idea/
 *.swp
@@ -26,3 +22,9 @@ build/
 
 # Logs
 *.log
+
+# Terraform (estado y secretos)
+terraform/.terraform/
+terraform/terraform.tfstate*
+terraform/terraform.tfvars
+.env.production

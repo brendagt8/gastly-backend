@@ -1,50 +1,53 @@
 import anthropic
 from app.core.config import settings
+from app.models.category import Category
 
-CATEGORIES = ["despensa", "salidas", "gasolina", "salud", "suscripciones", "ropa", "otros"]
-
-SYSTEM_PROMPT = """Eres un clasificador de gastos personales para usuarios mexicanos.
+PROMPT_TEMPLATE = """Eres un clasificador de gastos personales para usuarios mexicanos.
 Tu única tarea es asignar UNA categoría a cada transacción bancaria.
 
 Categorías disponibles:
-- despensa: supermercados, tiendas de abarrotes, OXXO, Walmart, HEB, Soriana, Chedraui
-- salidas: restaurantes, cafeterías, bares, comida rápida, antros, entretenimiento
-- gasolina: gasolineras, estacionamientos, casetas, Uber/Didi si es transporte
-- salud: farmacias, hospitales, clínicas, médicos, laboratorios, ópticas
-- suscripciones: Netflix, Spotify, Disney+, HBO, Amazon Prime, servicios digitales mensuales
-- ropa: tiendas de ropa, zapaterías, Zara, H&M, Nike, Adidas
-- otros: todo lo que no encaje en las categorías anteriores
+{category_lines}
 
 Responde ÚNICAMENTE con el nombre de la categoría, sin explicación ni puntuación."""
 
+_client: anthropic.AsyncAnthropic | None = None
 
-async def categorize(merchant: str, bank: str) -> str:
+
+def _get_client() -> anthropic.AsyncAnthropic:
+    global _client
+    if _client is None:
+        _client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+    return _client
+
+
+async def categorize(merchant: str, bank: str, categories: list[Category]) -> str:
+    """Asigna una categoría usando Claude Haiku; si no hay API key o la
+    llamada falla, usa las keywords de cada categoría como fallback.
+    `categories` viene de la BD ordenada por sort_order."""
+    valid = {c.id for c in categories}
+    default = "otros" if "otros" in valid else (categories[-1].id if categories else "otros")
+
     if not settings.ANTHROPIC_API_KEY:
-        return _rule_based_fallback(merchant)
+        return _rule_based_fallback(merchant, categories, default)
 
-    client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-    message = await client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=20,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Comercio: {merchant}\nBanco: {bank}"}],
-    )
+    category_lines = "\n".join(f"- {c.id}: {c.description}" for c in categories)
+    try:
+        message = await _get_client().messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=20,
+            system=PROMPT_TEMPLATE.format(category_lines=category_lines),
+            messages=[{"role": "user", "content": f"Comercio: {merchant}\nBanco: {bank}"}],
+        )
+    except anthropic.AnthropicError:
+        # Si la API falla (rate limit, red, etc.) no rompemos el sync: usamos reglas
+        return _rule_based_fallback(merchant, categories, default)
     result = message.content[0].text.strip().lower()
-    return result if result in CATEGORIES else "otros"
+    return result if result in valid else default
 
 
-def _rule_based_fallback(merchant: str) -> str:
+def _rule_based_fallback(merchant: str, categories: list[Category], default: str) -> str:
     m = merchant.upper()
-    if any(k in m for k in ["HEB", "WALMART", "SORIANA", "CHEDRAUI", "OXXO", "SEVEN", "SUPER", "MERCADO", "BODEGA"]):
-        return "despensa"
-    if any(k in m for k in ["PEMEX", "TOTAL GAS", "GASOLINERA", "BP", "SHELL", "G500"]):
-        return "gasolina"
-    if any(k in m for k in ["FARMACIA", "GUADALAJARA", "SIMILARES", "BENAVIDES", "HOSPITAL", "CLINICA", "DR ", "DRA "]):
-        return "salud"
-    if any(k in m for k in ["NETFLIX", "SPOTIFY", "DISNEY", "HBO", "AMAZON PRIME", "APPLE", "GOOGLE ONE", "YOUTUBE"]):
-        return "suscripciones"
-    if any(k in m for k in ["ZARA", "H&M", "NIKE", "ADIDAS", "PULL&BEAR", "STRADIVARIUS", "BERSHKA"]):
-        return "ropa"
-    if any(k in m for k in ["STARBUCKS", "MCDONALD", "DOMINO", "PIZZA", "RESTAURANT", "SUSHI", "TACO", "BURGER", "KFC"]):
-        return "salidas"
-    return "otros"
+    for c in categories:
+        if any(k in m for k in c.keyword_list()):
+            return c.id
+    return default

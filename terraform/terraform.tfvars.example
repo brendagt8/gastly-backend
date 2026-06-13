@@ -1,0 +1,11 @@
+# Copia este archivo a terraform.tfvars y llena los valores.
+# terraform.tfvars está en .gitignore — nunca lo subas al repo.
+
+# Tu IP pública (curl -s ifconfig.me) con /32:
+my_ip_cidr = "189.123.45.67/32"
+
+# Contenido de ~/.ssh/gastly.pub (generar con: ssh-keygen -t ed25519 -f ~/.ssh/gastly)
+ssh_public_key = "ssh-ed25519 AAAA... brenda@mac"
+
+# Password para PostgreSQL (inventa uno fuerte, mínimo 8 caracteres)
+db_password = "cambia-esto"

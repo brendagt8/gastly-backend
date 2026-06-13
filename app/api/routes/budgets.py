@@ -1,20 +1,22 @@
 from datetime import date
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
 from app.models.budget import Budget
+from app.models.category import Category
 from app.schemas.budget import BudgetSet, BudgetOut
 
 router = APIRouter(prefix="/budgets", tags=["budgets"])
 
-CATEGORIES = ["despensa", "salidas", "gasolina", "salud", "suscripciones", "ropa", "otros"]
-DEFAULT_AMOUNTS = {
-    "despensa": 3000, "salidas": 2000, "gasolina": 1500, "salud": 1000,
-    "suscripciones": 500, "ropa": 2000, "otros": 1000,
-}
+
+async def _active_categories(db: AsyncSession) -> list[Category]:
+    result = await db.execute(
+        select(Category).where(Category.active.is_(True)).order_by(Category.sort_order)
+    )
+    return list(result.scalars().all())
 
 
 @router.get("", response_model=list[BudgetOut])
@@ -30,11 +32,11 @@ async def get_budgets(
     existing = {b.category: b for b in result.scalars().all()}
 
     # Crear entradas por defecto para categorías sin presupuesto
-    for cat in CATEGORIES:
-        if cat not in existing:
-            b = Budget(user_id=current_user.id, category=cat, amount=DEFAULT_AMOUNTS[cat], month=target)
+    for cat in await _active_categories(db):
+        if cat.id not in existing:
+            b = Budget(user_id=current_user.id, category=cat.id, amount=cat.default_budget, month=target)
             db.add(b)
-            existing[cat] = b
+            existing[cat.id] = b
 
     if any(b.id is None for b in existing.values()):
         await db.commit()
@@ -53,6 +55,8 @@ async def set_budget(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if category not in {c.id for c in await _active_categories(db)}:
+        raise HTTPException(status_code=400, detail=f"Categoría inválida: {category}")
     target = month or date.today().strftime("%Y-%m")
     result = await db.execute(
         select(Budget).where(

@@ -3,12 +3,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import init_db
-from app.api.routes import auth, transactions, budgets, goals
+from app.core.seed import seed_defaults
+from app.api.routes import auth, transactions, budgets, goals, categories
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    await seed_defaults()
     yield
 
 
@@ -31,6 +33,7 @@ app.include_router(auth.router)
 app.include_router(transactions.router)
 app.include_router(budgets.router)
 app.include_router(goals.router)
+app.include_router(categories.router)
 
 
 @app.get("/")

@@ -1,3 +1,4 @@
+from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,7 +8,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import create_access_token, get_current_user
 from app.models.user import User
-from app.schemas.user import TokenOut, UserOut
+from app.schemas.user import TokenOut, UserOut, UserUpdate
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -19,7 +20,7 @@ MOBILE_REDIRECT_SCHEME = "gastly://auth"
 @router.get("/google/login")
 async def google_login(platform: str = "web"):
     """
-    Devuelve la URL de autorización de Google.
+    Redirige a la pantalla de autorización de Google.
     platform=mobile → el callback redirigirá a gastly://auth?token=...
     platform=web    → el callback devuelve JSON con el token
     """
@@ -32,9 +33,9 @@ async def google_login(platform: str = "web"):
         "prompt": "consent",
         "state": platform,  # "mobile" o "web"
     }
-    query = "&".join(f"{k}={v}" for k, v in params.items())
-    url = f"https://accounts.google.com/o/oauth2/v2/auth?{query}"
-    return {"url": url}
+    # El móvil abre este endpoint directo en el navegador (openAuthSessionAsync),
+    # así que debe ser un redirect, no JSON
+    return RedirectResponse(url=f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}")
 
 
 @router.get("/google/callback")
@@ -98,4 +99,19 @@ async def google_callback(code: str, state: str = "web", db: AsyncSession = Depe
 
 @router.get("/me", response_model=UserOut)
 async def me(current_user: User = Depends(get_current_user)):
+    return current_user
+
+
+@router.patch("/me", response_model=UserOut)
+async def update_me(
+    body: UserUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if body.monthly_income is not None:
+        current_user.monthly_income = body.monthly_income
+    if body.savings_percent is not None:
+        current_user.savings_percent = body.savings_percent
+    await db.commit()
+    await db.refresh(current_user)
     return current_user

@@ -1,23 +1,18 @@
 import base64
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from app.core.config import settings
 from app.services.email_parser import parse_bank_email, ParsedTransaction
 
+# Los bancos soportados son mexicanos; convertir el internalDate (UTC) a esta
+# zona evita que una compra de las 11pm quede fechada al día siguiente
+MX_TZ = ZoneInfo("America/Mexico_City")
+
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
-BANK_KEYWORDS = ["compra", "cargo", "movimiento", "transacción", "pago con tarjeta"]
-
-
-def _build_gmail(access_token: str, refresh_token: str):
-    creds = Credentials(
-        token=access_token,
-        refresh_token=refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=settings.GOOGLE_CLIENT_ID,
-        client_secret=settings.GOOGLE_CLIENT_SECRET,
-    )
-    return build("gmail", "v1", credentials=creds)
+BANK_KEYWORDS = ["compra", "cargo", "movimiento", "transacción", '"pago con tarjeta"']
 
 
 def _decode_body(payload: dict) -> str:
@@ -35,12 +30,22 @@ def fetch_new_bank_emails(
     access_token: str,
     refresh_token: str,
     after_timestamp: int | None = None,
-) -> list[tuple[str, ParsedTransaction]]:
+    sender_map: dict[str, str] | None = None,
+) -> tuple[list[tuple[str, ParsedTransaction]], str | None]:
     """
-    Devuelve lista de (gmail_message_id, ParsedTransaction) de correos bancarios nuevos.
+    Devuelve (lista de (gmail_message_id, ParsedTransaction), access_token_refrescado).
     after_timestamp es epoch en segundos; si es None trae los últimos 30 días.
+    El segundo elemento es el access token nuevo si el cliente de Google lo
+    refrescó durante la llamada (expiran en 1h), o None si sigue siendo el mismo.
     """
-    service = _build_gmail(access_token, refresh_token)
+    creds = Credentials(
+        token=access_token,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=settings.GOOGLE_CLIENT_ID,
+        client_secret=settings.GOOGLE_CLIENT_SECRET,
+    )
+    service = build("gmail", "v1", credentials=creds)
 
     query_parts = [f"({' OR '.join(BANK_KEYWORDS)})"]
     if after_timestamp:
@@ -60,8 +65,14 @@ def fetch_new_bank_emails(
         subject = headers.get("subject", "")
         body = _decode_body(msg["payload"])
 
-        parsed = parse_bank_email(sender, subject, body)
+        # internalDate: epoch en milisegundos de cuando Gmail recibió el correo
+        email_date = None
+        if msg.get("internalDate"):
+            email_date = datetime.fromtimestamp(int(msg["internalDate"]) / 1000, tz=MX_TZ).date()
+
+        parsed = parse_bank_email(sender, subject, body, email_date, sender_map)
         if parsed:
             results.append((msg_ref["id"], parsed))
 
-    return results
+    refreshed_token = creds.token if creds.token != access_token else None
+    return results, refreshed_token

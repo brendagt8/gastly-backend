@@ -1,16 +1,31 @@
-from datetime import date
+from datetime import date, timedelta
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.user import User
 from app.models.transaction import Transaction
+from app.models.category import Category
+from app.models.bank_sender import BankSender
 from app.schemas.transaction import TransactionCreate, TransactionCategoryUpdate, TransactionOut
 from app.services.categorizer import categorize
 from app.services.gmail_service import fetch_new_bank_emails
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
+
+
+async def _active_categories(db: AsyncSession) -> list[Category]:
+    result = await db.execute(
+        select(Category).where(Category.active.is_(True)).order_by(Category.sort_order)
+    )
+    return list(result.scalars().all())
+
+
+async def _validate_category(db: AsyncSession, category: str) -> None:
+    if category not in {c.id for c in await _active_categories(db)}:
+        raise HTTPException(status_code=400, detail=f"Categoría inválida: {category}")
 
 
 @router.get("", response_model=list[TransactionOut])
@@ -20,12 +35,15 @@ async def list_transactions(
     current_user: User = Depends(get_current_user),
 ):
     target = month or date.today().strftime("%Y-%m")
-    year, mon = target.split("-")
+    year, mon = (int(p) for p in target.split("-"))
+    month_start = date(year, mon, 1)
+    month_end = date(year + 1, 1, 1) if mon == 12 else date(year, mon + 1, 1)
     result = await db.execute(
         select(Transaction)
         .where(
             Transaction.user_id == current_user.id,
-            Transaction.date >= date(int(year), int(mon), 1),
+            Transaction.date >= month_start,
+            Transaction.date < month_end,
         )
         .order_by(desc(Transaction.date), desc(Transaction.created_at))
     )
@@ -38,6 +56,7 @@ async def add_manual_transaction(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _validate_category(db, body.category)
     tx = Transaction(
         user_id=current_user.id,
         merchant=body.merchant,
@@ -60,6 +79,7 @@ async def recategorize(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    await _validate_category(db, body.category)
     result = await db.execute(
         select(Transaction).where(Transaction.id == transaction_id, Transaction.user_id == current_user.id)
     )
@@ -82,18 +102,49 @@ async def sync_gmail(
     if not current_user.google_access_token:
         raise HTTPException(status_code=400, detail="Gmail no conectado")
 
-    email_txs = fetch_new_bank_emails(
+    # Sync incremental: buscar desde el último correo sincronizado (con colchón
+    # de 3 días por correos retrasados); el dedup por email_id cubre el traslape.
+    last_sync = await db.execute(
+        select(func.max(Transaction.created_at)).where(
+            Transaction.user_id == current_user.id,
+            Transaction.email_id.is_not(None),
+        )
+    )
+    # created_at es timezone-aware en Postgres, así que .timestamp() es correcto
+    last_dt = last_sync.scalar()
+    after_ts = int((last_dt - timedelta(days=3)).timestamp()) if last_dt else None
+
+    # Remitentes bancarios reconocidos (tabla bank_senders)
+    senders = await db.execute(select(BankSender).where(BankSender.active.is_(True)))
+    sender_map = {s.email.lower(): s.parser_key for s in senders.scalars().all()}
+
+    categories = await _active_categories(db)
+
+    # El cliente de Gmail es síncrono: correrlo en threadpool para no bloquear el event loop
+    email_txs, refreshed_token = await run_in_threadpool(
+        fetch_new_bank_emails,
         current_user.google_access_token,
         current_user.google_refresh_token,
+        after_ts,
+        sender_map,
     )
+    if refreshed_token:
+        # Google renueva el access token cada hora; persistirlo evita
+        # re-refrescarlo en cada sync
+        current_user.google_access_token = refreshed_token
 
     saved = []
     for email_id, parsed in email_txs:
-        existing = await db.execute(select(Transaction).where(Transaction.email_id == email_id))
+        existing = await db.execute(
+            select(Transaction).where(
+                Transaction.email_id == email_id,
+                Transaction.user_id == current_user.id,
+            )
+        )
         if existing.scalar_one_or_none():
             continue  # ya procesado
 
-        category = await categorize(parsed.merchant, parsed.bank)
+        category = await categorize(parsed.merchant, parsed.bank, categories)
 
         tx = Transaction(
             user_id=current_user.id,
@@ -108,7 +159,7 @@ async def sync_gmail(
         db.add(tx)
         saved.append(tx)
 
-    if saved:
+    if saved or refreshed_token:
         await db.commit()
         for tx in saved:
             await db.refresh(tx)
